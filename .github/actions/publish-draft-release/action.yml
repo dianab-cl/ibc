@@ -4,10 +4,9 @@ name: Publish draft release
 description: >-
   Collects the `release-assets-*` artifacts uploaded by the attest-release-assets action,
   verifies every asset against its attestation bundles, signs a `checksums.txt` over the assets,
-  SBOMs and combined attestation bundle with cosign, and attaches everything to a draft release
-  for the tag, with a "Verifying the release" section in its notes. Must run for a tag: a tag
-  push, or a manual run started from the tag. The calling job needs `contents: write` and
-  `id-token: write`.
+  SBOMs and combined attestation bundle with cosign, and attaches everything to a draft release for the pushed tag, with a
+  "Verifying the release" section in its notes. Must run in a job triggered by a tag push. The
+  calling job needs `contents: write` and `id-token: write`.
 
 inputs:
   name:
@@ -26,13 +25,6 @@ inputs:
     description: Verify every asset against the attestation bundles before signing (`true` or `false`).
     required: false
     default: "true"
-  dry-run:
-    description: >-
-      Do everything except create or update the release, and upload what would be released as the
-      `release-dry-run` artifact instead (`true` or `false`). Can run for a branch, to test the
-      release workflow.
-    required: false
-    default: "false"
   github-token:
     description: Token used to create the release and verify the attestations.
     required: false
@@ -40,7 +32,7 @@ inputs:
 
 outputs:
   url:
-    description: URL of the draft (or already published) release. Empty for a dry run.
+    description: URL of the draft (or already published) release.
     value: ${{ steps.release.outputs.url }}
 
 runs:
@@ -52,21 +44,20 @@ runs:
         NAME: ${{ inputs.name }}
         PRERELEASE: ${{ inputs.prerelease }}
         VERIFY: ${{ inputs.verify }}
-        DRY_RUN: ${{ inputs.dry-run }}
       run: |
         # The verification notes name the tag through GITHUB_REF and the signing workflow through
         # GITHUB_WORKFLOW_REF, so the release must be for the tag this run was triggered by.
-        if [[ "$DRY_RUN" != "true" && "$GITHUB_REF_TYPE" != "tag" ]]; then
-          echo "::error::publish-draft-release must run for a tag (a tag push, or a manual run from the tag), not ${GITHUB_REF}; set dry-run to test it from a branch"
+        if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+          echo "::error::publish-draft-release must run for a tag push, not ${GITHUB_REF}"
           exit 1
         fi
         if [[ ! "$NAME" =~ ^[0-9A-Za-z][0-9A-Za-z._-]*$ ]]; then
           echo "::error::name may only contain letters, digits, '.', '_' and '-' (got '${NAME}')"
           exit 1
         fi
-        for value in "$PRERELEASE" "$VERIFY" "$DRY_RUN"; do
+        for value in "$PRERELEASE" "$VERIFY"; do
           if [[ "$value" != "true" && "$value" != "false" ]]; then
-            echo "::error::prerelease, verify and dry-run must be 'true' or 'false' (got '${value}')"
+            echo "::error::prerelease and verify must be 'true' or 'false' (got '${value}')"
             exit 1
           fi
         done
@@ -151,89 +142,30 @@ runs:
 
     - name: Write verification notes
       shell: bash
-      env:
-        NAME: ${{ inputs.name }}
-        CERT_IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
       run: |
-        # Every command is rendered with this release's files, repository and tag, so it can be
+        # The command is rendered with this release's archives, repository and tag, so it can be
         # copied and run as is.
         assets=$(tr '\n' ' ' < "${RUNNER_TEMP}/release-assets.txt")
-        files=$(cd "${RUNNER_TEMP}/release-dist" && ls | tr '\n' ' ')
         workflow="${GITHUB_WORKFLOW_REF%@*}"
-        workflow_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/${workflow#"${GITHUB_REPOSITORY}"/}"
         cat > "${RUNNER_TEMP}/release-verify.md" <<EOF
         ## Verifying the release
 
-        Every file in this release was built from the \`${GITHUB_REF_NAME}\` tag by the [release workflow](${workflow_url}) and signed with [Sigstore](https://www.sigstore.dev/). Verifying a file proves that it is the file that workflow built, unmodified. Use either option.
-
-        | | What it checks | Prerequisites |
-        | --- | --- | --- |
-        | Option 1 | The build provenance (repository, workflow, tag and commit) and the SBOM of each archive | [GitHub CLI](https://cli.github.com), signed in |
-        | Option 2 | The signature over \`checksums.txt\`, then the checksum of each file in it | [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) 3 or later, and \`curl\` |
-
-        Install the prerequisites with [Homebrew](https://brew.sh) on macOS or Linux:
+        Verify the build provenance and SBOM of each archive with the [GitHub CLI](https://cli.github.com):
 
         \`\`\`sh
-        brew install gh && gh auth login   # Option 1
-        brew install cosign                # Option 2
-        \`\`\`
-
-        Or follow the [GitHub CLI](https://github.com/cli/cli#installation) and [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) installation guides.
-
-        ### Option 1: GitHub CLI
-
-        Download the release into a new \`${GITHUB_REF_NAME}\` directory and verify the provenance and SBOM attestations of each archive:
-
-        \`\`\`sh
-        gh release download ${GITHUB_REF_NAME} --repo ${GITHUB_REPOSITORY} --dir ${GITHUB_REF_NAME}
-        cd ${GITHUB_REF_NAME}
+        gh release download ${GITHUB_REF_NAME} --repo ${GITHUB_REPOSITORY} --dir ${GITHUB_REF_NAME} && cd ${GITHUB_REF_NAME}
         for asset in ${assets% }; do
           for predicate in https://slsa.dev/provenance/v1 https://spdx.dev/Document/v2.3; do
-            gh attestation verify "\$asset" \\
-              --repo ${GITHUB_REPOSITORY} \\
-              --signer-workflow ${workflow} \\
-              --source-ref ${GITHUB_REF} \\
+            gh attestation verify "\$asset" --repo ${GITHUB_REPOSITORY} \\
+              --signer-workflow ${workflow} --source-ref ${GITHUB_REF} \\
               --predicate-type "\$predicate" || break 2
           done
         done
         \`\`\`
-
-        Each check prints \`✓ Verification succeeded!\`. To verify against the downloaded attestations rather than GitHub's attestations API, add \`--bundle ${NAME}.intoto.jsonl\`.
-
-        ### Option 2: cosign and checksums
-
-        This option needs no GitHub account. Download the release into a new \`${GITHUB_REF_NAME}\` directory, verify the signature over \`checksums.txt\`, then check every file against it:
-
-        \`\`\`sh
-        mkdir ${GITHUB_REF_NAME} && cd ${GITHUB_REF_NAME}
-        for file in ${files% }; do
-          curl -fsSLO "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/\$file" || break
-        done
-        cosign verify-blob checksums.txt \\
-          --bundle checksums.txt.sigstore.json \\
-          --certificate-identity "${CERT_IDENTITY}" \\
-          --certificate-oidc-issuer https://token.actions.githubusercontent.com
-        shasum -a 256 --check checksums.txt
-        \`\`\`
-
-        \`cosign\` prints \`Verified OK\` and \`shasum\` prints \`OK\` for each file. To check only the files you downloaded, add \`--ignore-missing\` to \`shasum\`.
         EOF
-
-    - name: Upload dry run
-      if: inputs.dry-run == 'true'
-      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-      with:
-        name: release-dry-run
-        path: |
-          ${{ runner.temp }}/release-dist/
-          ${{ runner.temp }}/release-verify.md
-        if-no-files-found: error
-        overwrite: true
-        retention-days: 7
 
     - name: Create or update draft release
       id: release
-      if: inputs.dry-run != 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
