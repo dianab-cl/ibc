@@ -155,32 +155,68 @@ runs:
         NAME: ${{ inputs.name }}
         CERT_IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
       run: |
-        example=$(head -n 1 "${RUNNER_TEMP}/release-assets.txt")
+        # Every command is rendered with this release's files, repository and tag, so it can be
+        # copied and run as is.
+        assets=$(tr '\n' ' ' < "${RUNNER_TEMP}/release-assets.txt")
+        files=$(cd "${RUNNER_TEMP}/release-dist" && ls | tr '\n' ' ')
+        workflow="${GITHUB_WORKFLOW_REF%@*}"
+        workflow_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/${workflow#"${GITHUB_REPOSITORY}"/}"
         cat > "${RUNNER_TEMP}/release-verify.md" <<EOF
         ## Verifying the release
 
-        Verify the build provenance of a release asset. Add
-        \`--predicate-type https://spdx.dev/Document/v2.3\` to verify its SBOM instead, or
-        \`--bundle ${NAME}.intoto.jsonl\` to verify without the attestations API:
+        Every file in this release was built from the \`${GITHUB_REF_NAME}\` tag by the [release workflow](${workflow_url}) and signed with [Sigstore](https://www.sigstore.dev/). Verifying a file proves that it is the file that workflow built, unmodified. Use either option.
+
+        | | What it checks | Prerequisites |
+        | --- | --- | --- |
+        | Option 1 | The build provenance (repository, workflow, tag and commit) and the SBOM of each archive | [GitHub CLI](https://cli.github.com), signed in |
+        | Option 2 | The signature over \`checksums.txt\`, then the checksum of each file in it | [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) 3 or later, and \`curl\` |
+
+        Install the prerequisites with [Homebrew](https://brew.sh) on macOS or Linux:
 
         \`\`\`sh
-        gh attestation verify ${example} \\
-          --repo ${GITHUB_REPOSITORY} \\
-          --signer-workflow ${GITHUB_WORKFLOW_REF%@*} \\
-          --source-ref ${GITHUB_REF}
+        brew install gh && gh auth login   # Option 1
+        brew install cosign                # Option 2
         \`\`\`
 
-        Or verify the signed checksums and then the assets against them:
+        Or follow the [GitHub CLI](https://github.com/cli/cli#installation) and [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) installation guides.
+
+        ### Option 1: GitHub CLI
+
+        Download the release into a new \`${GITHUB_REF_NAME}\` directory and verify the provenance and SBOM attestations of each archive:
 
         \`\`\`sh
+        gh release download ${GITHUB_REF_NAME} --repo ${GITHUB_REPOSITORY} --dir ${GITHUB_REF_NAME}
+        cd ${GITHUB_REF_NAME}
+        for asset in ${assets% }; do
+          for predicate in https://slsa.dev/provenance/v1 https://spdx.dev/Document/v2.3; do
+            gh attestation verify "\$asset" \\
+              --repo ${GITHUB_REPOSITORY} \\
+              --signer-workflow ${workflow} \\
+              --source-ref ${GITHUB_REF} \\
+              --predicate-type "\$predicate" || break 2
+          done
+        done
+        \`\`\`
+
+        Each check prints \`✓ Verification succeeded!\`. To verify against the downloaded attestations rather than GitHub's attestations API, add \`--bundle ${NAME}.intoto.jsonl\`.
+
+        ### Option 2: cosign and checksums
+
+        This option needs no GitHub account. Download the release into a new \`${GITHUB_REF_NAME}\` directory, verify the signature over \`checksums.txt\`, then check every file against it:
+
+        \`\`\`sh
+        mkdir ${GITHUB_REF_NAME} && cd ${GITHUB_REF_NAME}
+        for file in ${files% }; do
+          curl -fsSLO "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/\$file" || break
+        done
         cosign verify-blob checksums.txt \\
           --bundle checksums.txt.sigstore.json \\
           --certificate-identity "${CERT_IDENTITY}" \\
           --certificate-oidc-issuer https://token.actions.githubusercontent.com
-        sha256sum --check --ignore-missing checksums.txt
-        # or, on macOS without sha256sum:
-        shasum -a 256 --check --ignore-missing checksums.txt
+        shasum -a 256 --check checksums.txt
         \`\`\`
+
+        \`cosign\` prints \`Verified OK\` and \`shasum\` prints \`OK\` for each file. To check only the files you downloaded, add \`--ignore-missing\` to \`shasum\`.
         EOF
 
     - name: Upload dry run
