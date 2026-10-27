@@ -4,9 +4,9 @@ name: Publish draft release
 description: >-
   Collects the `release-assets-*` artifacts uploaded by the attest-release-assets action,
   verifies every asset against its attestation bundles, signs a `checksums.txt` over the assets,
-  SBOMs and combined attestation bundle with cosign, and attaches everything to a draft release for the pushed tag, with a
-  "Verifying the release" section in its notes. Must run in a job triggered by a tag push. The
-  calling job needs `contents: write` and `id-token: write`.
+  SBOMs and combined attestation bundle with cosign, and attaches everything to a draft release for
+  the pushed tag. Must run in a job triggered by a tag push. The calling job needs `contents: write`
+  and `id-token: write`.
 
 inputs:
   name:
@@ -45,7 +45,7 @@ runs:
         PRERELEASE: ${{ inputs.prerelease }}
         VERIFY: ${{ inputs.verify }}
       run: |
-        # The verification notes name the tag through GITHUB_REF and the signing workflow through
+        # The verification checks the tag through GITHUB_REF and the signing workflow through
         # GITHUB_WORKFLOW_REF, so the release must be for the tag this run was triggered by.
         if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
           echo "::error::publish-draft-release must run for a tag push, not ${GITHUB_REF}"
@@ -117,9 +117,8 @@ runs:
         GH_TOKEN: ${{ inputs.github-token }}
         NAME: ${{ inputs.name }}
       run: |
-        # Check the assets against the bundles before signing, the same way the release notes tell
-        # users to, so a release never ships an asset that differs from what its build attested
-        # or a bundle that does not verify.
+        # Check the assets against the bundles before signing, so a release never ships an asset
+        # that differs from what its build attested or a bundle that does not verify.
         dist="${RUNNER_TEMP}/release-dist"
         while IFS= read -r file; do
           for predicate in https://slsa.dev/provenance/v1 https://spdx.dev/Document/v2.3; do
@@ -140,30 +139,6 @@ runs:
         cd "${RUNNER_TEMP}/release-dist" || exit 1
         cosign sign-blob --yes --bundle checksums.txt.sigstore.json checksums.txt
 
-    - name: Write verification notes
-      shell: bash
-      run: |
-        # The command is rendered with this release's archives, repository and tag, so it can be
-        # copied and run as is.
-        assets=$(tr '\n' ' ' < "${RUNNER_TEMP}/release-assets.txt")
-        workflow="${GITHUB_WORKFLOW_REF%@*}"
-        cat > "${RUNNER_TEMP}/release-verify.md" <<EOF
-        ## Verifying the release
-
-        Verify the build provenance and SBOM of each archive with the [GitHub CLI](https://cli.github.com):
-
-        \`\`\`sh
-        gh release download ${GITHUB_REF_NAME} --repo ${GITHUB_REPOSITORY} --dir ${GITHUB_REF_NAME} && cd ${GITHUB_REF_NAME}
-        for asset in ${assets% }; do
-          for predicate in https://slsa.dev/provenance/v1 https://spdx.dev/Document/v2.3; do
-            gh attestation verify "\$asset" --repo ${GITHUB_REPOSITORY} \\
-              --signer-workflow ${workflow} --source-ref ${GITHUB_REF} \\
-              --predicate-type "\$predicate" || break 2
-          done
-        done
-        \`\`\`
-        EOF
-
     - name: Create or update draft release
       id: release
       shell: bash
@@ -175,7 +150,6 @@ runs:
         PRERELEASE: ${{ inputs.prerelease }}
       run: |
         dist="${RUNNER_TEMP}/release-dist"
-        notes="${RUNNER_TEMP}/release-verify.md"
 
         if view=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>&1); then
           is_draft="$view"
@@ -188,8 +162,7 @@ runs:
             --draft \
             "${prerelease[@]}" \
             --verify-tag \
-            --title "$TITLE" \
-            --notes-file "$notes"
+            --title "$TITLE"
           echo "url=$(gh release view "$TAG" --json url --jq .url)" >> "$GITHUB_OUTPUT"
           exit 0
         else
@@ -208,11 +181,5 @@ runs:
           # fails here instead of swapping assets under a published release.
           echo "::warning::Release ${TAG} was published before its signed assets were attached"
           gh release upload "$TAG" "$dist"/*
-        fi
-
-        body=$(gh release view "$TAG" --json body --jq .body)
-        if [[ "$body" != *"## Verifying the release"* ]]; then
-          printf '%s\n\n%s\n' "$body" "$(cat "$notes")" > "${RUNNER_TEMP}/release-notes.md"
-          gh release edit "$TAG" --notes-file "${RUNNER_TEMP}/release-notes.md"
         fi
         echo "url=$(gh release view "$TAG" --json url --jq .url)" >> "$GITHUB_OUTPUT"
